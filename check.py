@@ -49,3 +49,22 @@ async def main():
                 queue, text = await get_text(browser, a, i)
             except Exception as e:
                 print("fail", key, e)
+                continue
+            # дату обновления убираем, чтобы она не вызывала лишние сообщения
+            core = re.sub(r"Дата оновлення.*", "", text, flags=re.S).strip()
+            h = hashlib.sha256((queue + core).encode()).hexdigest()
+            if state.get(key) != h:
+                r = await http.post(
+                    f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                    json={"chat_id": a["chat_id"], "text": f"{queue}\n\n{text}"},
+                )
+                print("telegram:", r.status_code, r.text[:200])
+                if r.status_code == 200:
+                    state[key] = h
+            else:
+                print("no changes", key)
+        await browser.close()
+    json.dump(state, open("state.json", "w"))
+
+
+asyncio.run(main())
