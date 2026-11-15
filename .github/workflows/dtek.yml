@@ -1,0 +1,33 @@
+name: dtek
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency: dtek
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install playwright httpx && playwright install --with-deps chromium
+      - run: python check.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADDRESSES: ${{ secrets.ADDRESSES }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: debug
+          path: error*.png
+          if-no-files-found: ignore
+      - run: |
+          git config user.name bot
+          git config user.email bot@users.noreply.github.com
+          git add state.json
+          git diff --cached --quiet || (git commit -m state && git push)
