@@ -14,6 +14,10 @@ except FileNotFoundError:
     state = {}
 
 
+def save_state():
+    json.dump(state, open("state.json", "w"))
+
+
 def norm(s):
     return s.replace("’", "'").replace("ʼ", "'").replace("`", "'").lower().strip()
 
@@ -151,8 +155,24 @@ async def get_text(browser, a):
         await ctx.close()
 
 
+async def send_telegram(http, chat_id, text):
+    for attempt in range(1, 4):
+        try:
+            r = await http.post(
+                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text},
+                timeout=30,
+            )
+            print("telegram:", r.status_code, r.text[:200])
+            return r.status_code == 200
+        except Exception as e:
+            print(f"telegram попытка {attempt} не удалась:", repr(e))
+            await asyncio.sleep(3)
+    return False
+
+
 async def main():
-    async with async_playwright() as p, httpx.AsyncClient() as http:
+    async with async_playwright() as p, httpx.AsyncClient(timeout=30) as http:
         browser = await p.chromium.launch()
         for a in ADDRS:
             key = str(a["chat_id"])
@@ -172,17 +192,13 @@ async def main():
             core = re.sub(r"Дата оновлення.*", "", text, flags=re.S).strip()
             h = hashlib.sha256((queue + core).encode()).hexdigest()
             if state.get(key) != h:
-                r = await http.post(
-                    f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                    json={"chat_id": a["chat_id"], "text": f"{queue}\n\n{text}"},
-                )
-                print("telegram:", r.status_code, r.text[:200])
-                if r.status_code == 200:
+                if await send_telegram(http, a["chat_id"], f"{queue}\n\n{text}"):
                     state[key] = h
+                    save_state()
             else:
                 print("no changes", key)
         await browser.close()
-    json.dump(state, open("state.json", "w"))
+    save_state()
 
 
 asyncio.run(main())
