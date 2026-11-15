@@ -5,6 +5,8 @@ from playwright.async_api import async_playwright
 URL = "https://www.dtek-dnem.com.ua/ua/shutdowns"
 TOKEN = os.environ["BOT_TOKEN"]
 ADDRS = json.loads(os.environ["ADDRESSES"])
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
 try:
     state = json.load(open("state.json"))
@@ -12,17 +14,32 @@ except FileNotFoundError:
     state = {}
 
 
-async def on_response(r):
-    try:
-        if "dtek-dnem.com.ua" in r.url and r.request.resource_type in ("xhr", "fetch"):
-            try:
-                body = (await r.text())[:300].replace("\n", " ")
-            except Exception:
-                body = ""
-            post = (r.request.post_data or "")[:200]
-            print("NET:", r.request.method, r.url, r.status, "| post:", post, "| body:", body)
-    except Exception:
-        pass
+def norm(s):
+    return s.replace("’", "'").replace("ʼ", "'").replace("`", "'").lower().strip()
+
+
+PREFIXES = r"(м\.|с\.|смт\.?|с-ще|вул\.|просп\.|пров\.|бульв\.|пл\.|узвіз|шосе)"
+
+
+def body(t):
+    return re.sub(r"^" + PREFIXES + r"\s*", "", norm(t))
+
+
+def choose(texts, query, prefix):
+    q = norm(query)
+    cands = list(enumerate(texts))
+    if prefix:
+        p = norm(prefix)
+        pc = [(i, t) for i, t in cands if norm(t).startswith(p)]
+        if pc:
+            cands = pc
+    for i, t in cands:
+        if norm(t) == q or body(t) == q:
+            return i
+    for i, t in cands:
+        if q in norm(t):
+            return i
+    return cands[0][0] if cands else None
 
 
 async def close_popups(page):
@@ -47,118 +64,96 @@ async def close_popups(page):
         pass
 
 
-JS_STREETS = """
-([city, q]) => {
-  const norm = s => s.replace(/[’ʼ`]/g, "'").toLowerCase().trim();
-  const D = (typeof DisconSchedule !== 'undefined') ? DisconSchedule : window.DisconSchedule;
-  const streets = (D && D.streets) || {};
-  const key = Object.keys(streets).find(k => norm(k) === norm(city))
-           || Object.keys(streets).find(k => norm(k).includes(norm(city)) || norm(city).includes(norm(k)));
-  if (!key) return {key: null, sample: Object.keys(streets).slice(0, 10), matches: []};
-  const matches = streets[key].filter(s => norm(s).includes(norm(q)));
-  return {key, matches};
-}
-"""
-
-JS_FIND = """
-(v) => {
-  const out = [];
-  document.querySelectorAll('body *').forEach(el => {
-    if (el.children.length === 0 && el.tagName !== 'SCRIPT' &&
-        el.textContent.toLowerCase().includes(v.toLowerCase())) {
-      const r = el.getBoundingClientRect();
-      const chain = [];
-      let p = el;
-      for (let i = 0; i < 4 && p; i++) {
-        chain.push(p.tagName + '.' + (p.className || '') + '#' + (p.id || ''));
-        p = p.parentElement;
-      }
-      out.push({visible: r.width > 0 && r.height > 0, text: el.textContent.trim().slice(0, 60), chain});
-    }
-  });
-  return out.slice(0, 15);
-}
-"""
-
-
-async def debug_dump(page, value):
-    try:
-        found = await page.evaluate(JS_FIND, value)
-        print("ELEMENTS WITH TEXT:", json.dumps(found, ensure_ascii=False))
-        form = page.locator("#discon_form")
-        html = await form.inner_html()
-        html = re.sub(r"<svg.*?</svg>", "", html, flags=re.S)
-        print("FORM HTML:", html[:2500])
-    except Exception as e:
-        print("debug error:", e)
-
-
-async def fill(page, field_id, value):
+async def fill(page, field_id, queries, prefix=None):
     form = page.locator("#discon_form")
     inp = form.locator(f"#{field_id}")
-    await inp.click()
-    await inp.press_sequentially(value, delay=120)
-
-    target = None
-    for _ in range(40):  # ждём до 10 секунд
-        exact = form.get_by_text(value, exact=True).locator("visible=true")
-        if await exact.count():
-            target = exact.first
+    items = form.locator(".autocomplete-items > div")
+    texts = []
+    for q in queries:
+        await inp.click()
+        await inp.fill("")
+        await inp.press_sequentially(q, delay=150)
+        for _ in range(24):  # ждём до 6 секунд
+            n = await items.count()
+            if n:
+                await page.wait_for_timeout(500)
+                n = await items.count()
+                texts = [(await items.nth(i).inner_text()).strip() for i in range(n)]
+                break
+            await page.wait_for_timeout(250)
+        if texts:
             break
-        part = form.get_by_text(value).locator("visible=true")
-        if await part.count():
-            target = part.first
-            break
-        await page.wait_for_timeout(250)
-    if target is None:
+    print(f"OPTIONS {field_id}:", texts[:15])
+    if not texts:
         print("INPUT VALUE:", await inp.input_value())
-        await debug_dump(page, value)
-        raise Exception(f"не нашёл подсказку для поля {field_id}")
-    await target.click()
+        raise Exception(f"нет подсказок для поля {field_id}")
+    idx = choose(texts, queries[0], prefix)
+    if idx is None:
+        raise Exception(f"не выбрал подсказку для поля {field_id}")
+    await items.nth(idx).click()
     await page.wait_for_timeout(1500)
+    print(f"CHOSEN {field_id}:", await inp.input_value())
 
 
-async def get_text(browser, a, idx):
-    page = await browser.new_page(viewport={"width": 1280, "height": 900})
-    page.on("response", on_response)
+async def get_text(browser, a):
+    ctx = await browser.new_context(
+        user_agent=UA,
+        locale="uk-UA",
+        timezone_id="Europe/Kyiv",
+        viewport={"width": 1280, "height": 900},
+    )
+    page = await ctx.new_page()
     try:
         await page.goto(URL, wait_until="networkidle", timeout=60000)
+        try:
+            await page.wait_for_function(
+                "typeof DisconSchedule !== 'undefined' && DisconSchedule.streets", timeout=20000
+            )
+        except Exception:
+            print("DisconSchedule не загрузился")
         await page.wait_for_timeout(2000)
         await close_popups(page)
 
-        await fill(page, "city", a["city"])
-        city_val = await page.locator("#discon_form #city").input_value()
-        print("CITY CHOSEN:", city_val)
+        m = re.match(r"^\s*(м\.|с\.|смт\.?|с-ще)\s*(.*)$", a["city"], re.I)
+        c_prefix, c_query = (m.group(1), m.group(2)) if m else (None, a["city"])
 
-        # достаём полное название улицы из данных страницы (например "вул. Харківська")
-        info = await page.evaluate(JS_STREETS, [city_val, a["street"]])
-        print("STREETS INFO:", json.dumps(info, ensure_ascii=False)[:600])
-        street_full = info["matches"][0] if info.get("matches") else a["street"]
-        print("STREET FULL:", street_full)
-
-        await fill(page, "street", street_full)
-        await fill(page, "house_num", a["house"])
+        await fill(page, "city", [c_query], c_prefix)
+        await fill(page, "street", [a["street"], "вул. " + a["street"]])
+        await fill(page, "house_num", [a["house"]])
         await page.wait_for_timeout(3000)
         queue = (await page.locator("#group-name").inner_text()).strip()
         text = (await page.locator("#showCurOutage").inner_text()).strip()
         return queue, text
     except Exception:
-        await page.screenshot(path=f"error{idx}.png")
+        try:
+            await page.screenshot(path=f"error{a['chat_id']}.png")
+            html = await page.locator("#discon_form").inner_html()
+            html = re.sub(r"<svg.*?</svg>", "", html, flags=re.S)
+            print("FORM HTML:", html[:1800])
+        except Exception:
+            pass
         raise
     finally:
-        await page.close()
+        await ctx.close()
 
 
 async def main():
     async with async_playwright() as p, httpx.AsyncClient() as http:
         browser = await p.chromium.launch()
-        for i, a in enumerate(ADDRS):
+        for a in ADDRS:
             key = str(a["chat_id"])
-            try:
-                queue, text = await get_text(browser, a, i)
-            except Exception as e:
-                print("fail", key, e)
+            result = None
+            for attempt in range(1, 4):
+                try:
+                    result = await get_text(browser, a)
+                    break
+                except Exception as e:
+                    print(f"попытка {attempt} не удалась:", e)
+                    await asyncio.sleep(5)
+            if not result:
+                print("fail", key)
                 continue
+            queue, text = result
             # дату обновления убираем, чтобы она не вызывала лишние сообщения
             core = re.sub(r"Дата оновлення.*", "", text, flags=re.S).strip()
             h = hashlib.sha256((queue + core).encode()).hexdigest()
