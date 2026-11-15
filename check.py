@@ -120,16 +120,30 @@ async def get_text(browser, a):
         await fill(page, "city", [c_query], c_prefix)
         await fill(page, "street", [a["street"], "вул. " + a["street"]])
         await fill(page, "house_num", [a["house"]])
-        await page.wait_for_timeout(3000)
-        queue = (await page.locator("#group-name").inner_text()).strip()
-        text = (await page.locator("#showCurOutage").inner_text()).strip()
+
+        # ждём, пока сайт покажет очередь (пока грузится, там "undefined")
+        try:
+            await page.wait_for_function(
+                """() => {
+                    const el = document.querySelector('#discon_form #group-name');
+                    if (!el) return false;
+                    const t = (el.textContent || '').trim();
+                    return t.length > 0 && !t.includes('undefined');
+                }""",
+                timeout=15000,
+            )
+        except Exception:
+            print("очередь не появилась, читаю как есть")
+        await page.wait_for_timeout(2000)
+
+        queue = ((await page.locator("#discon_form #group-name").first.text_content()) or "").strip()
+        queue = re.sub(r"\s+", " ", queue)
+        text = (await page.locator("#showCurOutage").first.inner_text()).strip()
+        print("QUEUE:", queue)
         return queue, text
     except Exception:
         try:
             await page.screenshot(path=f"error{a['chat_id']}.png")
-            html = await page.locator("#discon_form").inner_html()
-            html = re.sub(r"<svg.*?</svg>", "", html, flags=re.S)
-            print("FORM HTML:", html[:1800])
         except Exception:
             pass
         raise
