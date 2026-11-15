@@ -12,20 +12,57 @@ except FileNotFoundError:
     state = {}
 
 
+async def close_popups(page):
+    # закрываем всплывающее окно "Шановні клієнти!"
+    for sel in [
+        "[class*='modal'] [class*='close']:visible",
+        "[class*='popup'] [class*='close']:visible",
+        "button[class*='close']:visible",
+        "[class*='close']:visible",
+    ]:
+        try:
+            el = page.locator(sel).first
+            if await el.count():
+                await el.click(timeout=2000)
+                await page.wait_for_timeout(500)
+                break
+        except Exception:
+            pass
+    try:
+        await page.keyboard.press("Escape")
+    except Exception:
+        pass
+
+
 async def fill(page, field_id, value):
     form = page.locator("#discon_form")
     inp = form.locator(f"#{field_id}")
     await inp.click()
-    await inp.press_sequentially(value, delay=120)
-    opt = form.locator(".autocomplete-items div", has_text=value).first
-    await opt.wait_for(timeout=10000)
-    await opt.click()
+    await inp.press_sequentially(value, delay=150)
+
+    target = None
+    for _ in range(40):  # ждём до 10 секунд
+        exact = form.get_by_text(value, exact=True).locator("visible=true")
+        if await exact.count():
+            target = exact.first
+            break
+        part = form.get_by_text(value).locator("visible=true")
+        if await part.count():
+            target = part.first
+            break
+        await page.wait_for_timeout(250)
+    if target is None:
+        raise Exception(f"не нашёл подсказку для поля {field_id}")
+    await target.click()
+    await page.wait_for_timeout(1000)
 
 
 async def get_text(browser, a, idx):
-    page = await browser.new_page()
+    page = await browser.new_page(viewport={"width": 1280, "height": 900})
     try:
         await page.goto(URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(2000)
+        await close_popups(page)
         await fill(page, "city", a["city"])
         await fill(page, "street", a["street"])
         await fill(page, "house_num", a["house"])
@@ -35,6 +72,12 @@ async def get_text(browser, a, idx):
         return queue, text
     except Exception:
         await page.screenshot(path=f"error{idx}.png")
+        try:
+            html = await page.locator("#discon_form").inner_html()
+            html = re.sub(r"<svg.*?</svg>", "", html, flags=re.S)
+            print("FORM HTML:", html[:4000])
+        except Exception as e2:
+            print("не смог получить HTML формы:", e2)
         raise
     finally:
         await page.close()
