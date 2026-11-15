@@ -14,9 +14,9 @@ except FileNotFoundError:
 
 async def on_response(r):
     try:
-        if r.request.resource_type in ("xhr", "fetch"):
+        if "dtek-dnem.com.ua" in r.url and r.request.resource_type in ("xhr", "fetch"):
             try:
-                body = (await r.text())[:250].replace("\n", " ")
+                body = (await r.text())[:300].replace("\n", " ")
             except Exception:
                 body = ""
             post = (r.request.post_data or "")[:200]
@@ -47,11 +47,25 @@ async def close_popups(page):
         pass
 
 
+JS_STREETS = """
+([city, q]) => {
+  const norm = s => s.replace(/[’ʼ`]/g, "'").toLowerCase().trim();
+  const D = (typeof DisconSchedule !== 'undefined') ? DisconSchedule : window.DisconSchedule;
+  const streets = (D && D.streets) || {};
+  const key = Object.keys(streets).find(k => norm(k) === norm(city))
+           || Object.keys(streets).find(k => norm(k).includes(norm(city)) || norm(city).includes(norm(k)));
+  if (!key) return {key: null, sample: Object.keys(streets).slice(0, 10), matches: []};
+  const matches = streets[key].filter(s => norm(s).includes(norm(q)));
+  return {key, matches};
+}
+"""
+
 JS_FIND = """
 (v) => {
   const out = [];
   document.querySelectorAll('body *').forEach(el => {
-    if (el.children.length === 0 && el.textContent.toLowerCase().includes(v.toLowerCase())) {
+    if (el.children.length === 0 && el.tagName !== 'SCRIPT' &&
+        el.textContent.toLowerCase().includes(v.toLowerCase())) {
       const r = el.getBoundingClientRect();
       const chain = [];
       let p = el;
@@ -71,6 +85,10 @@ async def debug_dump(page, value):
     try:
         found = await page.evaluate(JS_FIND, value)
         print("ELEMENTS WITH TEXT:", json.dumps(found, ensure_ascii=False))
+        form = page.locator("#discon_form")
+        html = await form.inner_html()
+        html = re.sub(r"<svg.*?</svg>", "", html, flags=re.S)
+        print("FORM HTML:", html[:2500])
     except Exception as e:
         print("debug error:", e)
 
@@ -79,7 +97,7 @@ async def fill(page, field_id, value):
     form = page.locator("#discon_form")
     inp = form.locator(f"#{field_id}")
     await inp.click()
-    await inp.press_sequentially(value, delay=150)
+    await inp.press_sequentially(value, delay=120)
 
     target = None
     for _ in range(40):  # ждём до 10 секунд
@@ -97,7 +115,7 @@ async def fill(page, field_id, value):
         await debug_dump(page, value)
         raise Exception(f"не нашёл подсказку для поля {field_id}")
     await target.click()
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(1500)
 
 
 async def get_text(browser, a, idx):
@@ -107,8 +125,18 @@ async def get_text(browser, a, idx):
         await page.goto(URL, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(2000)
         await close_popups(page)
+
         await fill(page, "city", a["city"])
-        await fill(page, "street", a["street"])
+        city_val = await page.locator("#discon_form #city").input_value()
+        print("CITY CHOSEN:", city_val)
+
+        # достаём полное название улицы из данных страницы (например "вул. Харківська")
+        info = await page.evaluate(JS_STREETS, [city_val, a["street"]])
+        print("STREETS INFO:", json.dumps(info, ensure_ascii=False)[:600])
+        street_full = info["matches"][0] if info.get("matches") else a["street"]
+        print("STREET FULL:", street_full)
+
+        await fill(page, "street", street_full)
         await fill(page, "house_num", a["house"])
         await page.wait_for_timeout(3000)
         queue = (await page.locator("#group-name").inner_text()).strip()
