@@ -12,6 +12,19 @@ except FileNotFoundError:
     state = {}
 
 
+async def on_response(r):
+    try:
+        if r.request.resource_type in ("xhr", "fetch"):
+            try:
+                body = (await r.text())[:250].replace("\n", " ")
+            except Exception:
+                body = ""
+            post = (r.request.post_data or "")[:200]
+            print("NET:", r.request.method, r.url, r.status, "| post:", post, "| body:", body)
+    except Exception:
+        pass
+
+
 async def close_popups(page):
     # закрываем всплывающее окно "Шановні клієнти!"
     for sel in [
@@ -34,6 +47,34 @@ async def close_popups(page):
         pass
 
 
+JS_FIND = """
+(v) => {
+  const out = [];
+  document.querySelectorAll('body *').forEach(el => {
+    if (el.children.length === 0 && el.textContent.toLowerCase().includes(v.toLowerCase())) {
+      const r = el.getBoundingClientRect();
+      const chain = [];
+      let p = el;
+      for (let i = 0; i < 4 && p; i++) {
+        chain.push(p.tagName + '.' + (p.className || '') + '#' + (p.id || ''));
+        p = p.parentElement;
+      }
+      out.push({visible: r.width > 0 && r.height > 0, text: el.textContent.trim().slice(0, 60), chain});
+    }
+  });
+  return out.slice(0, 15);
+}
+"""
+
+
+async def debug_dump(page, value):
+    try:
+        found = await page.evaluate(JS_FIND, value)
+        print("ELEMENTS WITH TEXT:", json.dumps(found, ensure_ascii=False))
+    except Exception as e:
+        print("debug error:", e)
+
+
 async def fill(page, field_id, value):
     form = page.locator("#discon_form")
     inp = form.locator(f"#{field_id}")
@@ -52,6 +93,8 @@ async def fill(page, field_id, value):
             break
         await page.wait_for_timeout(250)
     if target is None:
+        print("INPUT VALUE:", await inp.input_value())
+        await debug_dump(page, value)
         raise Exception(f"не нашёл подсказку для поля {field_id}")
     await target.click()
     await page.wait_for_timeout(1000)
@@ -59,6 +102,7 @@ async def fill(page, field_id, value):
 
 async def get_text(browser, a, idx):
     page = await browser.new_page(viewport={"width": 1280, "height": 900})
+    page.on("response", on_response)
     try:
         await page.goto(URL, wait_until="networkidle", timeout=60000)
         await page.wait_for_timeout(2000)
@@ -72,12 +116,6 @@ async def get_text(browser, a, idx):
         return queue, text
     except Exception:
         await page.screenshot(path=f"error{idx}.png")
-        try:
-            html = await page.locator("#discon_form").inner_html()
-            html = re.sub(r"<svg.*?</svg>", "", html, flags=re.S)
-            print("FORM HTML:", html[:4000])
-        except Exception as e2:
-            print("не смог получить HTML формы:", e2)
         raise
     finally:
         await page.close()
