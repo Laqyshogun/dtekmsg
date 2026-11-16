@@ -8,6 +8,10 @@ ADDRS = json.loads(os.environ["ADDRESSES"])
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
+# True: новое сообщение (с пушем) при начале/конце отключения, обновления тихо редактируются
+# False: всегда редактировать одно и то же сообщение
+NEW_ON_SWITCH = True
+
 try:
     state = json.load(open("state.json"))
 except FileNotFoundError:
@@ -155,20 +159,41 @@ async def get_text(browser, a):
         await ctx.close()
 
 
-async def send_telegram(http, chat_id, text):
+async def tg(http, method, payload):
+    # возвращает (http_status, json) или (None, None), если не удалось достучаться
     for attempt in range(1, 4):
         try:
             r = await http.post(
-                f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
+                f"https://api.telegram.org/bot{TOKEN}/{method}",
+                json=payload,
                 timeout=30,
             )
-            print("telegram:", r.status_code, r.text[:200])
-            return r.status_code == 200
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            print(f"telegram {method}:", r.status_code, r.text[:150])
+            return r.status_code, data
         except Exception as e:
-            print(f"telegram попытка {attempt} не удалась:", repr(e))
+            print(f"telegram {method} попытка {attempt} не удалась:", repr(e))
             await asyncio.sleep(3)
-    return False
+    return None, None
+
+
+async def deliver(http, chat_id, text, prev_mid, force_new):
+    """Редактирует прошлое сообщение или шлёт новое. Возвращает message_id или None."""
+    if prev_mid and not force_new:
+        status, data = await tg(http, "editMessageText",
+                                {"chat_id": chat_id, "message_id": prev_mid, "text": text})
+        if status == 200:
+            return prev_mid
+        if status == 400 and "not modified" in (data.get("description") or "").lower():
+            return prev_mid
+        print("не удалось отредактировать, шлю новое")
+    status, data = await tg(http, "sendMessage", {"chat_id": chat_id, "text": text})
+    if status == 200:
+        return data["result"]["message_id"]
+    return None
 
 
 def is_generic(text):
@@ -205,16 +230,24 @@ async def main():
             print("MODE:", "обычный текст" if generic else "ОТКЛЮЧЕНИЕ")
 
             if state.get(key) != h:
-                prev_outage = state.get(key + "_out", False)
-                if not generic:
+                prev_out = state.get(key + "_out", False)
+                prev_mid = state.get(key + "_mid")
+                outage = not generic
+                switched = outage != prev_out
+                force_new = (NEW_ON_SWITCH and switched) or not prev_mid
+
+                if outage:
                     msg = f"🔴 {queue}\n\n{text}"
-                elif prev_outage:
+                elif prev_out:
                     msg = f"🟢 Схоже, відключення закінчилось.\n\n{queue}\n\n{text}"
                 else:
                     msg = f"{queue}\n\n{text}"
-                if await send_telegram(http, a["chat_id"], msg):
+
+                mid = await deliver(http, a["chat_id"], msg, prev_mid, force_new)
+                if mid:
                     state[key] = h
-                    state[key + "_out"] = not generic
+                    state[key + "_out"] = outage
+                    state[key + "_mid"] = mid
                     save_state()
             else:
                 print("no changes", key)
