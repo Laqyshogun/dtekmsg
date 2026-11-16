@@ -171,6 +171,11 @@ async def send_telegram(http, chat_id, text):
     return False
 
 
+def is_generic(text):
+    # обычный текст "если света нет, подождите 15 минут" (отключения сейчас нет)
+    return "імовірно виникла аварійна ситуація" in text.lower()
+
+
 async def main():
     async with async_playwright() as p, httpx.AsyncClient(timeout=30) as http:
         browser = await p.chromium.launch()
@@ -188,12 +193,28 @@ async def main():
                 print("fail", key)
                 continue
             queue, text = result
-            # дату обновления убираем, чтобы она не вызывала лишние сообщения
-            core = re.sub(r"Дата оновлення.*", "", text, flags=re.S).strip()
-            h = hashlib.sha256((queue + core).encode()).hexdigest()
+
+            generic = is_generic(text)
+            if generic:
+                # обычный текст: дату обновления не учитываем
+                core = re.sub(r"Дата оновлення.*", "", text, flags=re.S).strip()
+            else:
+                # отключение: важно КАЖДОЕ обновление, дата входит в сравнение
+                core = text
+            h = hashlib.sha256((("G" if generic else "O") + queue + core).encode()).hexdigest()
+            print("MODE:", "обычный текст" if generic else "ОТКЛЮЧЕНИЕ")
+
             if state.get(key) != h:
-                if await send_telegram(http, a["chat_id"], f"{queue}\n\n{text}"):
+                prev_outage = state.get(key + "_out", False)
+                if not generic:
+                    msg = f"🔴 {queue}\n\n{text}"
+                elif prev_outage:
+                    msg = f"🟢 Схоже, відключення закінчилось.\n\n{queue}\n\n{text}"
+                else:
+                    msg = f"{queue}\n\n{text}"
+                if await send_telegram(http, a["chat_id"], msg):
                     state[key] = h
+                    state[key + "_out"] = not generic
                     save_state()
             else:
                 print("no changes", key)
